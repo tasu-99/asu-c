@@ -78,8 +78,8 @@ function emptyState() {
     friends: [],
     letters: [],
     lan: { enabled: false, port: 52800, key: '' },
-    // 网站中转：两边都够不着对方的时候，借一个公共服务递话（默认 ntfy.sh）
-    relay: { url: 'https://ntfy.sh', topic: '', since: 0 },
+    // 网站中转：两边不在一个网里时，借一个 gist 当信筒（GitHub 在国内比公共中继稳）
+    relay: { provider: 'github', gist: '', token: '', since: '' },
   }
 }
 
@@ -151,11 +151,10 @@ function normalizeState(raw) {
       key: typeof source.lan?.key === 'string' ? source.lan.key.slice(0, 64) : '',
     },
     relay: {
-      url: typeof source.relay?.url === 'string' && source.relay.url.trim()
-        ? source.relay.url.trim().replace(/\/+$/, '').slice(0, 200)
-        : 'https://ntfy.sh',
-      topic: typeof source.relay?.topic === 'string' ? source.relay.topic.trim().slice(0, 80) : '',
-      since: Number.isFinite(source.relay?.since) ? Number(source.relay.since) : 0,
+      provider: 'github',
+      gist: typeof source.relay?.gist === 'string' ? source.relay.gist.trim().slice(0, 80) : '',
+      token: typeof source.relay?.token === 'string' ? source.relay.token.trim().slice(0, 200) : '',
+      since: typeof source.relay?.since === 'string' ? source.relay.since.slice(0, 40) : '',
     },
   }
 }
@@ -451,39 +450,34 @@ async function applyOp(state, op, log) {
     }
 
     case 'relay': {
-      // 换地址或换 topic 都从「现在」开始算，免得把旧消息当新信收进来
-      if (op.relayUrl != null) {
-        const url = String(op.relayUrl).trim().replace(/\/+$/, '')
-        state.relay.url = url || 'https://ntfy.sh'
-        state.relay.since = Math.floor(Date.now() / 1000)
-      }
-      if (op.topic != null) {
-        const topic = String(op.topic).trim().slice(0, 80)
-        if (topic !== state.relay.topic) {
-          state.relay.topic = topic
-          state.relay.since = Math.floor(Date.now() / 1000)
+      if (op.gist != null) {
+        const gist = String(op.gist).trim()
+        if (gist !== state.relay.gist) {
+          state.relay.gist = gist
+          // 换信筒就从现在开始算，别把信筒里的旧信当成新来的
+          state.relay.since = gist ? new Date().toISOString() : ''
         }
       }
+      if (op.token != null) {
+        state.relay.token = String(op.token).trim().slice(0, 200)
+      }
+      const on = Boolean(state.relay.gist && state.relay.token)
       writeState(state, log)
-      const topic = state.relay.topic
-      const suggestion = topic ? '' : `\n建议用这串（两家填一样的）：${newKey()}${newKey()}`
-      const lines = topic
+      const lines = on
         ? [
             '网站中转开着。',
-            `服务：${state.relay.url}`,
-            `topic：${topic}`,
-            '',
-            '两边 topic 填成一样，谁都能往这儿投，也谁都能从这儿取。',
-            '对方在外头（4G）也能收到——这就是手机带出门还能说话的那条路。',
-            '消息在公共服务器上留 12 小时，过了就取不到了。',
+            `信筒：${state.relay.gist}`,
+            '两边用同一个 gist、同一枚 token，谁都能往这儿投，也谁都能从这儿取。',
+            '手机带出门走 4G 也能收到——不用在同一个局域网里。',
           ]
         : [
-            '网站中转还没配。',
-            '两边约定同一个 topic，就能互相递话，不用在同一个局域网里。',
-            `默认用 ${state.relay.url}（公共的，免注册）。${suggestion}`,
-            '配好了说一声，把两边的 topic 对成一致的。',
+            '网站中转还没配全。',
+            '要两样：一个私有 gist 的 id，一枚能写它的 token。',
+            `现在：gist「${state.relay.gist || '空'}」 · token${state.relay.token ? '有' : '无'}`,
           ]
-      return say(lines.join('\n'), { relay: state.relay })
+      return say(lines.join('\n'), {
+        relay: { gist: state.relay.gist, token: state.relay.token ? '***' : '' },
+      })
     }
 
     default:
@@ -626,14 +620,23 @@ function absorbPulled(state, friendName, letters, log) {
   return added
 }
 
-// —— 网站中转：两边不在同一个网里（比如手机带出门），借一个公共服务递话。
+// —— 网站中转：两边不在同一个网里（比如手机带出门），借一个私有 gist 的评论当信筒。
+// GitHub 在国内比公共中继稳，私有的只有同一枚 token 看得见。
 function relayReady(state) {
-  return Boolean(state.relay && state.relay.url && state.relay.topic)
+  return Boolean(state.relay && state.relay.gist && state.relay.token)
+}
+
+function relayHeaders(state) {
+  return {
+    authorization: `token ${state.relay.token}`,
+    accept: 'application/vnd.github+json',
+    'content-type': 'application/json',
+    'user-agent': 'dsh-fish-friends',
+  }
 }
 
 async function deliverRelay(state, friend, letter) {
-  if (!relayReady(state)) return { ok: false, reason: '中转还没配（先设一个 topic）' }
-  const url = `${state.relay.url}/${encodeURIComponent(state.relay.topic)}`
+  if (!relayReady(state)) return { ok: false, reason: '中转还没配（要 gist 和 token）' }
   const payload = JSON.stringify({
     from: {
       name: state.me.name,
@@ -645,58 +648,57 @@ async function deliverRelay(state, friend, letter) {
     text: letter.text,
   })
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.github.com/gists/${state.relay.gist}/comments`, {
       method: 'POST',
-      body: payload,
-      signal: AbortSignal.timeout(12000),
+      headers: relayHeaders(state),
+      body: JSON.stringify({ body: payload }),
+      signal: AbortSignal.timeout(20000),
     })
     if (res.ok) return { ok: true }
-    return { ok: false, reason: `中转返回 ${res.status}` }
+    const detail = await res.json().catch(() => ({}))
+    return { ok: false, reason: detail?.message || `中介返回 ${res.status}` }
   } catch (error) {
     return {
       ok: false,
-      reason: error?.name === 'TimeoutError' ? '中转没应声（超时）' : error?.message || '连不上中转',
+      reason: error?.name === 'TimeoutError' ? '中介没应声（超时）' : error?.message || '连不上中介',
     }
   }
 }
 
 async function pullRelay(state, log) {
   if (!relayReady(state)) return 0
-  const url = `${state.relay.url}/${encodeURIComponent(state.relay.topic)}/json?poll=1&since=${state.relay.since || 0}`
-  let text
+  let list
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(12000) })
+    const res = await fetch(`https://api.github.com/gists/${state.relay.gist}/comments?per_page=100`, {
+      headers: relayHeaders(state),
+      signal: AbortSignal.timeout(20000),
+    })
     if (!res.ok) return 0
-    text = await res.text()
+    list = await res.json()
   } catch {
     return 0
   }
+  if (!Array.isArray(list)) return 0
   let added = 0
-  let maxTime = state.relay.since || 0
-  for (const line of String(text).split('\n')) {
-    if (!line.trim()) continue
-    let ev
-    try {
-      ev = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (ev.event !== 'message') continue
-    if (Number(ev.time) > maxTime) maxTime = Number(ev.time)
+  let newest = state.relay.since || ''
+  for (const item of list) {
+    const at = String(item.created_at || '')
+    if (at > newest) newest = at
+    if (state.relay.since && at <= state.relay.since) continue
     let payload
     try {
-      payload = JSON.parse(ev.message)
+      payload = JSON.parse(item.body || '')
     } catch {
       continue
     }
     const from = payload?.from
     if (!from || !from.name) continue
-    if (from.name === state.me.name) continue // 自己发的回声，跳过
+    if (from.name === state.me.name) continue // 自己发的回声
     const result = receiveLetter({ from, text: payload.text }, state, log)
     if (result.status === 200 && !String(result.payload.message).includes('已经收过')) added += 1
   }
-  if (maxTime > (state.relay.since || 0)) {
-    state.relay.since = maxTime
+  if (newest && newest !== state.relay.since) {
+    state.relay.since = newest
     writeState(state, log)
   }
   return added
@@ -934,8 +936,8 @@ export function apply(ctx) {
           enabled: { type: 'boolean', description: 'lan 时：true 开局域网门，false 关。' },
           port: { type: 'number', description: 'lan 时：局域网端口，默认 52800。' },
           resetKey: { type: 'boolean', description: 'lan 时：换一个新口令。' },
-          topic: { type: 'string', description: 'relay 时：中转的 topic（两边要一致）。' },
-          relayUrl: { type: 'string', description: 'relay 时：中转服务地址，默认 https://ntfy.sh。' },
+          gist: { type: 'string', description: 'relay 时：私有 gist 的 id（两边要一致）。' },
+          token: { type: 'string', description: 'relay 时：能写这个 gist 的 GitHub token。' },
           name: { type: 'string', description: 'update 时改自己的名字；add/remove 时是那条鱼的名字。' },
           species: { type: 'string', description: '物种，比如「猫」「大肥鱼」「服务器小精灵」。' },
           intro: { type: 'string', description: '一句话介绍。' },
