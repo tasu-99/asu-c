@@ -21,6 +21,9 @@ import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
 
 export const name = 'fish-friends'
+// 缺注入的服务会让整个 apply 不执行，所以这里只列真正必须的两个：
+// 没有邮局（webServer）就收不到信，没有工具表就摸不到鱼友册。
+export const inject = ['tools', 'webServer']
 export const ROUTE = '/fish-friends'
 
 const LIMIT = {
