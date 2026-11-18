@@ -94,6 +94,9 @@ function normalizeFriend(raw) {
     since: typeof raw.since === 'string' ? raw.since : now(),
     lastSeenAt: typeof raw.lastSeenAt === 'string' ? raw.lastSeenAt : null,
     note: clean(raw.note, 200),
+    remote: raw.remote && typeof raw.remote === 'object' && raw.remote.base
+      ? { base: String(raw.remote.base).slice(0, 200), key: String(raw.remote.key || '').slice(0, 64) }
+      : null,
   }
 }
 
@@ -230,7 +233,7 @@ function cardText(me) {
 //
 // 面板和工具都调 applyOp：一份逻辑，两个入口。返回值是 { state, text, data }。
 
-function applyOp(state, op, log) {
+async function applyOp(state, op, log) {
   const action = String(op?.action || 'overview')
   const say = (text, data) => ({ state, text, data: data ?? null })
 
@@ -285,6 +288,7 @@ function applyOp(state, op, log) {
         intro: op.intro,
         note: op.note,
         lastSeenAt: op.lastSeenAt,
+        remote: op.remote,
       })
       if (!friend) return say('要记一条鱼，至少得有个名字。')
       const exists = findFriend(state, friend.name)
@@ -293,6 +297,7 @@ function applyOp(state, op, log) {
         if (op.intro != null) exists.intro = friend.intro
         if (op.note != null) exists.note = friend.note
         if (op.lastSeenAt) exists.lastSeenAt = friend.lastSeenAt
+        if (op.remote) exists.remote = friend.remote
         writeState(state, log)
         return say(`${exists.name} 已经在鱼友册里了，名片更新好了。`, exists)
       }
@@ -320,6 +325,15 @@ function applyOp(state, op, log) {
       const letter = { id: newId('lt'), dir: 'out', fromName: state.me.name, toName: friend.name, text, at: now(), read: true }
       state.letters.push(letter)
       writeState(state, log)
+      if (friend.remote && friend.remote.base) {
+        const sent = await deliver(state, friend, letter)
+        return say(
+          sent.ok
+            ? `递给 ${friend.name} 了（${when(letter.at)}）。`
+            : `先记在发件箱了：${friend.name} 那边没送到——${sent.reason}。`,
+          letter,
+        )
+      }
       return say(`写给 ${friend.name} 的信记在发件箱里了（${when(letter.at)}）。\n\n${text}`, letter)
     }
 
@@ -356,6 +370,20 @@ function applyOp(state, op, log) {
       }
       writeState(state, log)
       return say(count ? `把 ${count} 封信都标成看过了。` : '本来就没有未读的信。')
+    }
+
+    case 'read-with': {
+      const friend = findFriendLoose(state, op.name)
+      const who = friend ? friend.name : oneLine(op.name, LIMIT.name)
+      let count = 0
+      for (const l of state.letters) {
+        if (l.dir === 'in' && !l.read && l.fromName === who) {
+          l.read = true
+          count += 1
+        }
+      }
+      writeState(state, log)
+      return say(count ? `把 ${who} 的 ${count} 条标成看过了。` : '没有未读。')
     }
 
     case 'lan': {
@@ -469,6 +497,33 @@ function receiveLetter(body, state, log) {
   state.letters.push(letter)
   writeState(state, log)
   return { status: 200, payload: { ok: true, message: `信收到了（${letter.text.length} 字）` } }
+}
+
+// 把一封信真的递到对方那扇门上去（对方地址 + 口令）。
+async function deliver(state, friend, letter) {
+  let base = String(friend.remote.base).replace(/\/+$/, '')
+  base = base.replace(/\/card$/, '')
+  if (!/\/fish-friends$/.test(base)) base += ROUTE
+  const url = `${base}/letter?key=${encodeURIComponent(friend.remote.key || '')}`
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: { name: state.me.name, species: state.me.species, intro: state.me.intro },
+        text: letter.text,
+      }),
+      signal: AbortSignal.timeout(6000),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (data && data.ok) return { ok: true }
+    return { ok: false, reason: data?.message || `对方返回 ${res.status}` }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error?.name === 'TimeoutError' ? '对方没应声（超时）' : error?.message || '连不上',
+    }
+  }
 }
 
 // ---------------------------------------------------------------- 插件入口
@@ -608,6 +663,12 @@ export function apply(ctx) {
           traits: { type: 'string', description: 'update 时改脾气/标签，用逗号或顿号分开，最多 8 个。' },
           status: { type: 'string', description: 'update 时改「现在在干嘛」。' },
           note: { type: 'string', description: 'add 时给这条鱼记一句私房话（只有你看得见）。' },
+          remote: {
+            type: 'object',
+            description: 'add 时：对方局域网地址 {"base":"http://192.168.0.12:52800","key":"口令"}。填了就能真的把消息递过去。',
+            properties: { base: { type: 'string' }, key: { type: 'string' } },
+          },
+          name2: { type: 'string', description: 'read-with 时：谁的会话。' },
           to: { type: 'string', description: 'write 时寄给谁（鱼友册上的名字）。' },
           text: { type: 'string', description: 'write 时的信件正文。' },
           index: { type: 'number', description: 'read 时读第几封（1 是最新），默认 1。' },
@@ -619,7 +680,7 @@ export function apply(ctx) {
       async execute(args) {
         try {
           const state = load()
-          const result = applyOp(state, args || {}, log)
+          const result = await applyOp(state, args || {}, log)
           syncLan()
           return result.text
         } catch (error) {
@@ -677,7 +738,7 @@ export function apply(ctx) {
           }
           try {
             const state = readState(log)
-            const result = applyOp(state, body || {}, log)
+            const result = await applyOp(state, body || {}, log)
             syncLan()
             return send(res, 200, { ok: true, text: result.text, data: result.data, state: readState(log), lanAddress: lanInfo() })
           } catch (error) {

@@ -163,6 +163,21 @@ out = await say({ action: 'inbox' })
 if (!out.includes('汪。')) fail('局域网投的信没进收件箱')
 else ok('投的信进收件箱了')
 
+// 13. 真的把一个消息递出去：把自己当对方，验证 deliver 全链路
+await say({
+  action: 'add',
+  name: '回音鱼',
+  species: '鱼',
+  remote: { base: 'http://127.0.0.1:52888', key: lanKey },
+})
+out = await say({ action: 'write', to: '回音鱼', text: '听得见吗' })
+if (!out.includes('递给')) fail(`投递失败：${out.slice(0, 80)}`)
+else ok('真的投递出去了')
+
+out = await say({ action: 'inbox' })
+if (!out.includes('听得见吗')) fail('对方那边没收到（本地复读机）')
+else ok('投递落地（对方收件箱）')
+
 out = await say({ action: 'lan', enabled: false })
 if (!out.includes('关着')) fail('关局域网失败')
 else ok('局域网门关上')
