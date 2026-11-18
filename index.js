@@ -343,9 +343,26 @@ async function applyOp(state, op, log) {
     case 'inbox': {
       const boxes = state.letters.filter((l) => l.dir === 'in')
       if (!boxes.length) return say('信箱是空的。别的鱼还没来敲过门。')
+      // 「回没回」看的是有没有更晚的、写给同一个人的信——跟面板上标不标已读无关
+      const repliedTo = (letter) => {
+        const t = Date.parse(letter.at) || 0
+        return state.letters.some(
+          (out) =>
+            out.dir === 'out' &&
+            out.toName === letter.fromName &&
+            (Date.parse(out.at) || 0) > t,
+        )
+      }
       const list = [...boxes].reverse().slice(0, 10)
-      const lines = list.map((l) => `${l.read ? ' ' : '●'} ${when(l.at)} · ${l.fromName || '不知道谁'}${l.read ? '' : '（没看）'}\n   ${oneLine(l.text, 60)}`)
-      return say(`信箱 · 共 ${boxes.length} 封（未读 ${boxes.filter((l) => !l.read).length}）\n\n${lines.join('\n')}`, list)
+      const lines = list.map((l) => {
+        const tags = []
+        if (!l.read) tags.push('没看')
+        if (!repliedTo(l)) tags.push('待回')
+        const tail = tags.length ? `（${tags.join('、')}）` : ''
+        return `${l.read ? ' ' : '●'} ${when(l.at)} · ${l.fromName || '不知道谁'}${tail}\n   ${oneLine(l.text, 60)}`
+      })
+      const pending = boxes.filter((l) => !repliedTo(l)).length
+      return say(`信箱 · 共 ${boxes.length} 封（待回 ${pending}）\n\n${lines.join('\n')}`, list)
     }
 
     case 'read': {
@@ -541,6 +558,12 @@ function absorbPulled(state, friendName, letters, log) {
       at: raw.at,
     })
     if (!letter) continue
+    // 同一封信可能一边手动收过、一边又拉回来，两次的 id 不一样。
+    // 内容一样就当成一封，不然邮册里会叠两遍。
+    const dupText = state.letters.some(
+      (x) => x.dir === 'in' && x.fromName === friendName && x.text === letter.text,
+    )
+    if (dupText) continue
     state.letters.push(letter)
     added += 1
   }
