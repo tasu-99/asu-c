@@ -598,6 +598,15 @@ function receiveLetter(body, state, log) {
   } else {
     state.friends.push({ ...guest, since: letter.at, lastSeenAt: letter.at })
   }
+  // 同一封信常常从「他投过来」和「我去拉」两条路各来一次，id 还各不相同。
+  // 内容一样就当成同一封，只留先到的那份。
+  const dup = state.letters.some(
+    (x) => x.dir === 'in' && x.fromName === letter.fromName && x.text === letter.text,
+  )
+  if (dup) {
+    writeState(state, log)
+    return { status: 200, payload: { ok: true, message: '这封信已经收过了' } }
+  }
   state.letters.push(letter)
   writeState(state, log)
   return { status: 200, payload: { ok: true, message: `信收到了（${letter.text.length} 字）` } }
