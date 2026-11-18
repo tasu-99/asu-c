@@ -65,7 +65,7 @@ async function hit(routeKey, request) {
 
 if (!tool) fail('工具没注册上')
 else ok(`工具注册了：${tool.name}`)
-if (tool && tool.parameters.properties.action.enum.length !== 10) fail('action 枚举数量不对')
+if (tool && tool.parameters.properties.action.enum.length !== 11) fail('action 枚举数量不对')
 if (routes.size !== 5) fail(`路由数量不对：${[...routes.keys()].join(', ')}`)
 
 let out = await say({ action: 'overview' })
@@ -130,6 +130,42 @@ await say({ action: 'add', name: '临时鱼' })
 const rebuilt = JSON.parse(readFileSync(statePath, 'utf8'))
 if (!rebuilt.friends.some((f) => f.name === '临时鱼')) fail('state.json 删了以后写不回去')
 else ok('state.json 缺了也能重建')
+
+// 12. 局域网门：开、错口令、投信、关
+out = await say({ action: 'lan', enabled: true, port: 52888 })
+if (!out.includes('局域网的门开了')) fail('开局域网门失败')
+else ok('局域网门开')
+
+await new Promise((r) => setTimeout(r, 600))
+const lanState = JSON.parse(readFileSync(statePath, 'utf8'))
+const lanKey = lanState.lan && lanState.lan.key
+if (!lanKey) fail('局域网没生成口令')
+
+let r = await fetch('http://127.0.0.1:52888/fish-friends/card?key=wrong')
+if (r.status !== 403) fail(`错口令居然通了：${r.status}`)
+else ok('错口令被拒')
+
+r = await fetch(`http://127.0.0.1:52888/fish-friends/card?key=${lanKey}`)
+const card = await r.json()
+if (!card.ok || card.card.name !== '阿溯') fail('局域网名片不对')
+else ok('局域网名片')
+
+r = await fetch(`http://127.0.0.1:52888/fish-friends/letter?key=${lanKey}`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ from: { name: '隔壁的狗', species: '狗' }, text: '汪。' }),
+})
+const sent2 = await r.json()
+if (!sent2.ok) fail(`局域网投信失败：${JSON.stringify(sent2)}`)
+else ok('局域网投信')
+
+out = await say({ action: 'inbox' })
+if (!out.includes('汪。')) fail('局域网投的信没进收件箱')
+else ok('投的信进收件箱了')
+
+out = await say({ action: 'lan', enabled: false })
+if (!out.includes('关着')) fail('关局域网失败')
+else ok('局域网门关上')
 
 rmSync(home, { recursive: true, force: true })
 console.log(process.exitCode ? '\n有失败项' : '\n全部通过')

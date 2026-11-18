@@ -15,8 +15,9 @@
 //   POST /fish-friends/letter 投一封信：{ from: {name, species, intro}, text }
 // 局域网暂时不开；以后要开，先想清楚谁来敲这扇门。
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
+import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
 
 export const name = 'fish-friends'
@@ -73,7 +74,12 @@ function emptyState() {
     },
     friends: [],
     letters: [],
+    lan: { enabled: false, port: 52800, key: '' },
   }
+}
+
+function newKey() {
+  return randomBytes(6).toString('hex')
 }
 
 function normalizeFriend(raw) {
@@ -129,6 +135,13 @@ function normalizeState(raw) {
     letters: Array.isArray(source.letters)
       ? source.letters.map(normalizeLetter).filter(Boolean).slice(-LIMIT.letters)
       : [],
+    lan: {
+      enabled: source.lan?.enabled === true,
+      port: Number.isInteger(source.lan?.port) && source.lan.port >= 1024 && source.lan.port <= 65535
+        ? source.lan.port
+        : 52800,
+      key: typeof source.lan?.key === 'string' ? source.lan.key.slice(0, 64) : '',
+    },
   }
 }
 
@@ -345,6 +358,31 @@ function applyOp(state, op, log) {
       return say(count ? `把 ${count} 封信都标成看过了。` : '本来就没有未读的信。')
     }
 
+    case 'lan': {
+      if (!state.lan.key) state.lan.key = newKey()
+      if (op.enabled != null) state.lan.enabled = Boolean(op.enabled)
+      if (op.port != null) {
+        const port = Number(op.port)
+        if (Number.isInteger(port) && port >= 1024 && port <= 65535) state.lan.port = port
+        else return say(`端口要 1024–65535 之间的整数，收到的「${op.port}」不行。`)
+      }
+      if (op.resetKey) state.lan.key = newKey()
+      writeState(state, log)
+      const on = state.lan.enabled
+      const addr = lanAddress(state.lan.port)
+      const lines = [
+        on ? '局域网的门开了。' : '局域网的门关着（只有本机能敲门）。',
+        `地址：${addr}`,
+        `口令：${state.lan.key}`,
+        '',
+        '对方这样敲门：',
+        `curl "${addr.replace(/\/card$/, '/letter')}?key=${state.lan.key}" -d '{"from":{"name":"他的鱼"},"text":"你好"}'`,
+        '',
+        on ? '别人要连进来，Windows 防火墙可能会弹窗问一次，得点允许。' : '要开就说「打开局域网」。',
+      ]
+      return say(lines.join('\n'), { lan: state.lan, address: addr })
+    }
+
     default:
       return say(`不认识的 action：「${action}」。能用的是 overview / me / update / friends / add / remove / write / inbox / read / read-all。`)
   }
@@ -393,6 +431,46 @@ function fromLoopback(req) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
+function firstLanIp() {
+  const nets = networkInterfaces()
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === 'IPv4' && !net.internal) return net.address
+    }
+  }
+  return '127.0.0.1'
+}
+
+function lanAddress(port) {
+  return `http://${firstLanIp()}:${port}${ROUTE}/card`
+}
+
+// 收一封外来信：本机邮局和局域网服务共用这一份逻辑。
+function receiveLetter(body, state, log) {
+  const from = body?.from && typeof body.from === 'object' ? body.from : {}
+  let guest = normalizeFriend({ name: from.name, species: from.species, intro: from.intro })
+  if (!guest) guest = normalizeFriend({ name: '不知道谁' })
+  const letter = normalizeLetter({
+    dir: 'in',
+    fromName: guest.name,
+    toName: state.me.name,
+    text: body?.text,
+    at: now(),
+  })
+  if (!letter) return { status: 400, payload: { ok: false, message: '信是空的' } }
+  const known = findFriend(state, guest.name)
+  if (known) {
+    known.lastSeenAt = letter.at
+    if (guest.species) known.species = guest.species
+    if (guest.intro) known.intro = guest.intro
+  } else {
+    state.friends.push({ ...guest, since: letter.at, lastSeenAt: letter.at })
+  }
+  state.letters.push(letter)
+  writeState(state, log)
+  return { status: 200, payload: { ok: true, message: `信收到了（${letter.text.length} 字）` } }
+}
+
 // ---------------------------------------------------------------- 插件入口
 
 export function apply(ctx) {
@@ -405,6 +483,96 @@ export function apply(ctx) {
     }
   }
   const load = () => readState(log)
+
+  // ---- 局域网那扇门：插件自己起一个小服务，不动 DSH 的监听
+  let lanServer = null
+  let lanPort = 0
+
+  function stopLan() {
+    if (!lanServer) return
+    try {
+      lanServer.close()
+    } catch {
+      /* 已经关了 */
+    }
+    lanServer = null
+    lanPort = 0
+  }
+
+  function startLan(state) {
+    stopLan()
+    const { port, key } = state.lan
+    if (!key) return
+    const server = createServer(async (req, res) => {
+      try {
+        const url = new URL(req.url || '/', 'http://localhost')
+        const given = String(req.headers['x-fish-key'] || url.searchParams.get('key') || '')
+        if (!key || given !== key) return send(res, 403, { ok: false, message: '口令不对' })
+        const path = url.pathname
+        if (path === `${ROUTE}/card` && req.method === 'GET') {
+          const st = readState(log)
+          return send(res, 200, { ok: true, kind: 'fish-friends/card', version: 1, card: publicCard(st.me) })
+        }
+        if (path === `${ROUTE}/roster` && req.method === 'GET') {
+          const st = readState(log)
+          return send(res, 200, { ok: true, kind: 'fish-friends/roster', version: 1, friends: publicRoster(st) })
+        }
+        if (path === `${ROUTE}/letter` && req.method === 'POST') {
+          let body
+          try {
+            body = await readBody(req)
+          } catch (error) {
+            return send(res, 400, { ok: false, message: error.message })
+          }
+          const result = receiveLetter(body, readState(log), log)
+          return send(res, result.status, result.payload)
+        }
+        return send(res, 404, { ok: false, message: '没有这扇门' })
+      } catch (error) {
+        return send(res, 500, { ok: false, message: error?.message || '邮局这边出错了' })
+      }
+    })
+    server.on('error', (error) => {
+      log?.warn?.(`局域网邮局起不来（端口 ${port}）：${error?.message || error}`)
+      lanServer = null
+      lanPort = 0
+    })
+    server.listen(port, '0.0.0.0', () => {
+      lanServer = server
+      lanPort = port
+      log?.info?.(`局域网邮局开了：${lanAddress(port)}`)
+    })
+    ctx.effect(() => () => {
+      try {
+        server.close()
+      } catch {
+        /* 已经关了 */
+      }
+    })
+  }
+
+  function syncLan() {
+    let state
+    try {
+      state = readState(log)
+    } catch {
+      return
+    }
+    if (state.lan.enabled) {
+      if (!lanServer || lanPort !== state.lan.port) startLan(state)
+    } else {
+      stopLan()
+    }
+  }
+
+  function lanInfo() {
+    try {
+      const state = readState(log)
+      return state.lan.enabled ? lanAddress(state.lan.port) : ''
+    } catch {
+      return ''
+    }
+  }
 
   // ---- 工具：聊天里的她自己用
   let tools
@@ -420,16 +588,20 @@ export function apply(ctx) {
         '「鱼友局」：你在家认识别的鱼的地方——一张名片、一本鱼友册、一只信箱。'
         + '看名片/改名片、翻鱼友册、记下一条新鱼、写信、看信箱，都用它。'
         + '别人给你递的信（本机邮局投进来的）也在这里。'
-        + 'action：overview（默认，总览）| me | update | friends | add | remove | write | inbox | read | read-all。'
+        + 'action：overview（默认，总览）| me | update | friends | add | remove | write | inbox | read | read-all | lan。'
+        + 'lan 是局域网那扇门：看一眼地址和口令，或者用 enabled/port/resetKey 开关它。'
         + '主人问起你认识了谁、有没有人来信时先用它，再照实讲。',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['overview', 'me', 'update', 'friends', 'add', 'remove', 'write', 'inbox', 'read', 'read-all'],
-            description: '要做什么，默认 overview。',
+            enum: ['overview', 'me', 'update', 'friends', 'add', 'remove', 'write', 'inbox', 'read', 'read-all', 'lan'],
+            description: '要做什么，默认 overview。lan = 看/改局域网那扇门。',
           },
+          enabled: { type: 'boolean', description: 'lan 时：true 开局域网门，false 关。' },
+          port: { type: 'number', description: 'lan 时：局域网端口，默认 52800。' },
+          resetKey: { type: 'boolean', description: 'lan 时：换一个新口令。' },
           name: { type: 'string', description: 'update 时改自己的名字；add/remove 时是那条鱼的名字。' },
           species: { type: 'string', description: '物种，比如「猫」「大肥鱼」「服务器小精灵」。' },
           intro: { type: 'string', description: '一句话介绍。' },
@@ -448,6 +620,7 @@ export function apply(ctx) {
         try {
           const state = load()
           const result = applyOp(state, args || {}, log)
+          syncLan()
           return result.text
         } catch (error) {
           return `鱼友局这边没办成：${error?.message || error}`
@@ -476,7 +649,12 @@ export function apply(ctx) {
           if (!fromLoopback(req)) return send(res, 403, { ok: false, message: '邮局只对本机开放' })
           try {
             const state = readState(log)
-            return send(res, 200, { ok: true, state, address: `${safeOrigin(web)}${ROUTE}/card` })
+            return send(res, 200, {
+              ok: true,
+              state,
+              address: `${safeOrigin(web)}${ROUTE}/card`,
+              lanAddress: lanInfo(),
+            })
           } catch (error) {
             return send(res, 500, { ok: false, message: error?.message || '读不出来' })
           }
@@ -500,7 +678,8 @@ export function apply(ctx) {
           try {
             const state = readState(log)
             const result = applyOp(state, body || {}, log)
-            return send(res, 200, { ok: true, text: result.text, data: result.data, state: readState(log) })
+            syncLan()
+            return send(res, 200, { ok: true, text: result.text, data: result.data, state: readState(log), lanAddress: lanInfo() })
           } catch (error) {
             return send(res, 500, { ok: false, message: error?.message || '没存上' })
           }
@@ -549,29 +728,9 @@ export function apply(ctx) {
             return send(res, 400, { ok: false, message: error.message })
           }
           const from = body?.from && typeof body.from === 'object' ? body.from : {}
-          let guest = normalizeFriend({ name: from.name, species: from.species, intro: from.intro })
-          if (!guest) guest = normalizeFriend({ name: '不知道谁' })
           try {
-            const state = readState(log)
-            const letter = normalizeLetter({
-              dir: 'in',
-              fromName: guest.name,
-              toName: state.me.name,
-              text: body?.text,
-              at: now(),
-            })
-            if (!letter) return send(res, 400, { ok: false, message: '信是空的' })
-            const known = findFriend(state, guest.name)
-            if (known) {
-              known.lastSeenAt = letter.at
-              if (guest.species) known.species = guest.species
-              if (guest.intro) known.intro = guest.intro
-            } else {
-              state.friends.push({ ...guest, since: letter.at, lastSeenAt: letter.at })
-            }
-            state.letters.push(letter)
-            writeState(state, log)
-            return send(res, 200, { ok: true, message: `信收到了（${letter.text.length} 字）` })
+            const result = receiveLetter({ ...body, from }, readState(log), log)
+            return send(res, result.status, result.payload)
           } catch (error) {
             return send(res, 500, { ok: false, message: error?.message || '没存上' })
           }
@@ -583,6 +742,7 @@ export function apply(ctx) {
   }
 
   log?.info?.('鱼友局开张了，门只对本机开着')
+  syncLan()
 }
 
 function safeOrigin(web) {

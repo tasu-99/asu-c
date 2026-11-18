@@ -56,6 +56,18 @@ window.__ModuleLoader__.load({
         send: '寄出去',
         markAll: '全标已读',
         readMore: '展开',
+        lanTitle: '局域网的门',
+        lanOn: '开着',
+        lanOff: '关着',
+        lanOpen: '打开',
+        lanClose: '关上',
+        lanAddress: '局域网地址',
+        lanKey: '口令',
+        lanCopy: '复制邀请',
+        lanReset: '换口令',
+        lanKeyReset: '已换新口令',
+        lanHint: '别人连进来时 Windows 防火墙可能弹一次窗，得点允许。地址加口令，谁拿着谁就能投信。',
+        lanOffHint: '关着的时候只有本机能敲门。打开，同一个 WiFi 下的鱼才能投信进来。',
         loading: '正在开箱…',
         failed: '没开成',
         retry: '再试一次',
@@ -100,6 +112,18 @@ window.__ModuleLoader__.load({
         send: 'Send it',
         markAll: 'Mark all read',
         readMore: 'Open',
+        lanTitle: 'LAN door',
+        lanOn: 'open',
+        lanOff: 'closed',
+        lanOpen: 'Open',
+        lanClose: 'Close',
+        lanAddress: 'LAN address',
+        lanKey: 'Passphrase',
+        lanCopy: 'Copy invite',
+        lanReset: 'New key',
+        lanKeyReset: 'New passphrase set',
+        lanHint: 'Windows may ask once about the firewall — allow it. Anyone with the address and passphrase can drop a letter.',
+        lanOffHint: 'Closed: only this machine can knock. Open it to let fish on the same Wi-Fi write in.',
         loading: 'Opening the box…',
         failed: 'Would not open',
         retry: 'Try again',
@@ -376,6 +400,22 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const copyLan = async () => {
+        const address = state && state.lanAddress
+        const me = state && state.state && state.state.me
+        const lan = state && state.state && state.state.lan
+        const key = lan && lan.key
+        if (!address || !key) return
+        const letter = address.replace('/card', '/letter')
+        const text = `鱼友局 · ${(me && me.name) || '鱼'}\n名片：${address}\n投信：POST ${letter}?key=${key}\n口令：${key}`
+        try {
+          await navigator.clipboard.writeText(text)
+          flash(t('copied'))
+        } catch {
+          flash(t('copyFailed'))
+        }
+      }
+
       if (!data) {
         return h(
           'div',
@@ -554,6 +594,31 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'dff-letterText', 'data-preview': open ? 'false' : 'true' }, letter.text))
                   })
                 : h('p', { className: 'dff-empty' }, t('noLetters')),
+            ),
+            h(
+              'div',
+              { className: 'dff-card' },
+              h('div', { className: 'dff-cardHead' },
+                h('span', { className: 'dff-cardTitle' }, t('lanTitle')),
+                h('span', { className: 'dff-count' }, data.lan && data.lan.enabled ? t('lanOn') : t('lanOff')),
+                h('span', { className: 'dff-actions' },
+                  h('button', {
+                    type: 'button',
+                    className: 'dff-btn',
+                    disabled: busy,
+                    onClick: () => run({ action: 'lan', enabled: !(data.lan && data.lan.enabled) }),
+                  }, data.lan && data.lan.enabled ? t('lanClose') : t('lanOpen')))),
+              data.lan && data.lan.enabled
+                ? h('div', null,
+                    h('div', { className: 'dff-field' }, h('span', { className: 'dff-label' }, t('lanAddress')),
+                      h('input', { className: 'dff-input', readOnly: true, value: state.lanAddress || '—' })),
+                    h('div', { className: 'dff-field' }, h('span', { className: 'dff-label' }, t('lanKey')),
+                      h('input', { className: 'dff-input', readOnly: true, value: (data.lan && data.lan.key) || '—' })),
+                    h('div', { style: { display: 'flex', gap: 8 } },
+                      h('button', { type: 'button', className: 'dff-btn', onClick: copyLan }, t('lanCopy')),
+                      h('button', { type: 'button', className: 'dff-btn', disabled: busy, onClick: () => run({ action: 'lan', resetKey: true }, t('lanKeyReset')) }, t('lanReset'))),
+                    h('p', { className: 'dff-note', style: { marginTop: 8 } }, t('lanHint')))
+                : h('p', { className: 'dff-note' }, t('lanOffHint')),
             ),
           ),
         ),
