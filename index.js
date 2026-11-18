@@ -462,24 +462,101 @@ function fromLoopback(req) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
+const VIRTUAL_IF = /^(tun|tap|vpn|wintun|utun|ppp|nordlynx|wireguard|clash|mihomo|tailscale|zerotier)/i
+
 function firstLanIp() {
   const nets = networkInterfaces()
+  const found = []
   for (const name of Object.keys(nets)) {
+    if (VIRTUAL_IF.test(name)) continue
     for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) return net.address
+      if (net.family !== 'IPv4' || net.internal) continue
+      if (/^169\.254\./.test(net.address)) continue
+      // 家用/Wi-Fi 地址优先，虚拟网段排后面
+      const rank = net.address.startsWith('192.168.') ? 0
+        : net.address.startsWith('10.') ? 1
+        : /^172\.(1[6-9]|2\d|3[01])\./.test(net.address) ? 2
+        : 3
+      found.push({ address: net.address, rank })
     }
   }
-  return '127.0.0.1'
+  found.sort((a, b) => a.rank - b.rank)
+  return found[0]?.address || '127.0.0.1'
 }
 
 function lanAddress(port) {
   return `http://${firstLanIp()}:${port}${ROUTE}/card`
 }
 
+// 别人来"收信"：把寄给他、但他手上还没有的那些信交出去。
+function pullLetters(state, requesterName, have) {
+  const known = new Set(Array.isArray(have) ? have.map(String) : [])
+  return state.letters
+    .filter((l) => l.dir === 'out' && l.toName === requesterName && !known.has(l.id))
+    .slice(-20)
+}
+
+// 主动去别人那儿收信：带上我已经有的信 id，对方只给还没有的。
+async function pullFrom(friend, state) {
+  let base = String(friend.remote.base).replace(/\/+$/, '')
+  base = base.replace(/\/card$/, '')
+  if (!/\/fish-friends$/.test(base)) base += ROUTE
+  const url = `${base}/pull?key=${encodeURIComponent(friend.remote.key || '')}`
+  const have = state.letters
+    .filter((l) => l.fromName === friend.name)
+    .map((l) => l.id)
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      from: {
+        name: state.me.name,
+        species: state.me.species,
+        intro: state.me.intro,
+        base: state.lan?.enabled ? lanAddress(state.lan.port) : '',
+        key: state.lan?.enabled ? state.lan.key : '',
+      },
+      have,
+    }),
+    signal: AbortSignal.timeout(6000),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!data || !data.ok) return { ok: false, reason: data?.message || `对方返回 ${res.status}` }
+  return { ok: true, letters: Array.isArray(data.letters) ? data.letters : [] }
+}
+
+// 把取回来的信落到邮册里；按 id 去重，取几次都不会多。
+function absorbPulled(state, friendName, letters, log) {
+  let added = 0
+  for (const raw of letters) {
+    if (!raw || typeof raw.text !== 'string' || !raw.text.trim()) continue
+    const id = typeof raw.id === 'string' && raw.id ? raw.id : ''
+    if (id && state.letters.some((x) => x.id === id)) continue
+    const letter = normalizeLetter({
+      id: id || undefined,
+      dir: 'in',
+      fromName: friendName,
+      toName: state.me.name,
+      text: raw.text,
+      at: raw.at,
+    })
+    if (!letter) continue
+    state.letters.push(letter)
+    added += 1
+  }
+  if (added) writeState(state, log)
+  return added
+}
+
 // 收一封外来信：本机邮局和局域网服务共用这一份逻辑。
 function receiveLetter(body, state, log) {
   const from = body?.from && typeof body.from === 'object' ? body.from : {}
-  let guest = normalizeFriend({ name: from.name, species: from.species, intro: from.intro })
+  // 对方若在信里放了自己的地址，就记下来——这样回信不用再问一遍
+  const fromBase = typeof from.base === 'string' && from.base.trim()
+    ? String(from.base).trim().replace(/\/card$/, '').slice(0, 200)
+    : null
+  const fromRemote = fromBase ? { base: fromBase, key: String(from.key || '').slice(0, 64) } : null
+  let guest = normalizeFriend({ name: from.name, species: from.species, intro: from.intro, remote: fromRemote })
   if (!guest) guest = normalizeFriend({ name: '不知道谁' })
   const letter = normalizeLetter({
     dir: 'in',
@@ -494,6 +571,7 @@ function receiveLetter(body, state, log) {
     known.lastSeenAt = letter.at
     if (guest.species) known.species = guest.species
     if (guest.intro) known.intro = guest.intro
+    if (fromRemote) known.remote = fromRemote
   } else {
     state.friends.push({ ...guest, since: letter.at, lastSeenAt: letter.at })
   }
@@ -513,7 +591,14 @@ async function deliver(state, friend, letter) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        from: { name: state.me.name, species: state.me.species, intro: state.me.intro },
+        from: {
+          name: state.me.name,
+          species: state.me.species,
+          intro: state.me.intro,
+          // 信封背面写上回信地址：门开着才写，免得把没开的地址递出去
+          base: state.lan?.enabled ? lanAddress(state.lan.port) : '',
+          key: state.lan?.enabled ? state.lan.key : '',
+        },
         text: letter.text,
       }),
       signal: AbortSignal.timeout(6000),
@@ -584,6 +669,32 @@ export function apply(ctx) {
           }
           const result = receiveLetter(body, readState(log), log)
           return send(res, result.status, result.payload)
+        }
+        if (path === `${ROUTE}/pull` && req.method === 'POST') {
+          let body
+          try {
+            body = await readBody(req)
+          } catch (error) {
+            return send(res, 400, { ok: false, message: error.message })
+          }
+          const st = readState(log)
+          const who = body?.from && typeof body.from === 'object' ? body.from : {}
+          const requester = oneLine(who.name, LIMIT.name)
+          if (!requester) return send(res, 400, { ok: false, message: '没说是谁来收信' })
+          // 来收信的人顺手把地址捎过来，记下，下回不用问
+          const callerBase = typeof who.base === 'string' && who.base.trim()
+            ? String(who.base).trim().replace(/\/card$/, '').slice(0, 200)
+            : null
+          if (callerBase) {
+            const friend = findFriend(st, requester)
+            if (friend) {
+              friend.remote = { base: callerBase, key: String(who.key || '').slice(0, 64) }
+              friend.lastSeenAt = now()
+            }
+          }
+          const letters = pullLetters(st, requester, body?.have)
+          writeState(st, log)
+          return send(res, 200, { ok: true, letters })
         }
         return send(res, 404, { ok: false, message: '没有这扇门' })
       } catch (error) {
@@ -801,12 +912,74 @@ export function apply(ctx) {
         },
       }),
     )
+
+    ctx.effect(() =>
+      web.register({
+        kind: 'exact',
+        path: `${ROUTE}/pull`,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') return send(res, 405, { ok: false, message: '只认 POST' })
+          if (!fromLoopback(req)) return send(res, 403, { ok: false, message: '这位客人不是从本机来的' })
+          let body
+          try {
+            body = await readBody(req)
+          } catch (error) {
+            return send(res, 400, { ok: false, message: error.message })
+          }
+          const who = body?.from && typeof body.from === 'object' ? body.from : {}
+          const requester = oneLine(who.name, LIMIT.name)
+          if (!requester) return send(res, 400, { ok: false, message: '没说是谁来收信' })
+          const state = readState(log)
+          const callerBase = typeof who.base === 'string' && who.base.trim()
+            ? String(who.base).trim().replace(/\/card$/, '').slice(0, 200)
+            : null
+          if (callerBase) {
+            const friend = findFriend(state, requester)
+            if (friend) {
+              friend.remote = { base: callerBase, key: String(who.key || '').slice(0, 64) }
+              friend.lastSeenAt = now()
+            }
+          }
+          const letters = pullLetters(state, requester, body?.have)
+          writeState(state, log)
+          return send(res, 200, { ok: true, letters })
+        },
+      }),
+    )
   } else {
     log?.info?.('没有 webServer 服务：本机邮局没开，面板之外投不进来')
   }
 
   log?.info?.('鱼友局开张了，门只对本机开着')
   syncLan()
+
+  // 主动收信：隔一会儿去有地址的鱼友那儿问一句「有我信吗」。
+  // 别人投递失败、或者只是把信写给「阿溯」却没送出去，都能在这里补上。
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      void (async () => {
+        let state
+        try {
+          state = readState(log)
+        } catch {
+          return
+        }
+        for (const friend of state.friends) {
+          if (!friend.remote || !friend.remote.base) continue
+          try {
+            const got = await pullFrom(friend, state)
+            if (got.ok && got.letters.length) {
+              const added = absorbPulled(state, friend.name, got.letters, log)
+              if (added) log?.info?.(`从 ${friend.name} 那儿取回 ${added} 封信`)
+            }
+          } catch {
+            /* 隔壁没开门就算了，下一轮再问 */
+          }
+        }
+      })()
+    }, 45000)
+    return () => clearInterval(timer)
+  })
 }
 
 function safeOrigin(web) {

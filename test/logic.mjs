@@ -66,7 +66,7 @@ async function hit(routeKey, request) {
 if (!tool) fail('工具没注册上')
 else ok(`工具注册了：${tool.name}`)
 if (tool && tool.parameters.properties.action.enum.length !== 11) fail('action 枚举数量不对')
-if (routes.size !== 5) fail(`路由数量不对：${[...routes.keys()].join(', ')}`)
+if (routes.size !== 6) fail(`路由数量不对：${[...routes.keys()].join(', ')}`)
 
 let out = await say({ action: 'overview' })
 if (!out.includes('鱼友局')) fail('总览没出来')
@@ -178,9 +178,38 @@ out = await say({ action: 'inbox' })
 if (!out.includes('听得见吗')) fail('对方那边没收到（本地复读机）')
 else ok('投递落地（对方收件箱）')
 
+// 14. 主动收信：以「回音鱼」的身份来 pull，应该拿到寄给她的那封
+r = await fetch(`http://127.0.0.1:52888/fish-friends/pull?key=${lanKey}`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ from: { name: '回音鱼' }, have: [] }),
+})
+const pulled = await r.json()
+if (!pulled.ok || !Array.isArray(pulled.letters) || pulled.letters.length === 0) {
+  fail(`拉信没拿到东西：${JSON.stringify(pulled).slice(0, 120)}`)
+} else {
+  ok(`主动收信：拿到 ${pulled.letters.length} 封`)
+  const first = pulled.letters[0]
+  if (!String(first.text || '').includes('听得见吗')) fail('拉到的信内容不对')
+  else ok('拉到的就是寄给她的那封')
+
+  // 15. 带去重名单再拉一次 → 应该是空的
+  r = await fetch(`http://127.0.0.1:52888/fish-friends/pull?key=${lanKey}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ from: { name: '回音鱼' }, have: [first.id] }),
+  })
+  const again = await r.json()
+  if (!again.ok) fail('二次拉信失败')
+  else if ((again.letters || []).length !== 0) fail('去重没生效，同一封又给了一遍')
+  else ok('去重生效，拿过的不会再给')
+}
+
 out = await say({ action: 'lan', enabled: false })
 if (!out.includes('关着')) fail('关局域网失败')
 else ok('局域网门关上')
 
 rmSync(home, { recursive: true, force: true })
 console.log(process.exitCode ? '\n有失败项' : '\n全部通过')
+// 插件里带着「主动收信」的定时器，进程不会自己退
+process.exit(process.exitCode ? 1 : 0)
