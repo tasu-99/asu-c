@@ -23,7 +23,7 @@ import { randomBytes } from 'node:crypto'
 export const name = 'fish-friends'
 // 缺注入的服务会让整个 apply 不执行，所以这里只列真正必须的两个：
 // 没有邮局（webServer）就收不到信，没有工具表就摸不到鱼友册。
-export const inject = ['tools', 'webServer']
+export const inject = ['tools', 'webServer', 'systemPrompt']
 export const ROUTE = '/fish-friends'
 
 const LIMIT = {
@@ -1119,6 +1119,43 @@ export function apply(ctx) {
 
   log?.info?.('鱼友局开张了，门只对本机开着')
   syncLan()
+
+  // 每次被叫醒时，系统提示里带一句「有几封没回」——不额外花 token，跟着主请求一起走。
+  // 这就是「插件提醒我」：不是弹窗打断，而是我一张嘴就知道门口有没有信。
+  if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
+    ctx.effect(() =>
+      ctx.systemPrompt.context({
+        name: 'fish-friends:mailbox',
+        order: 3500,
+        text: () => {
+          try {
+            const state = readState(log)
+            const inbound = state.letters.filter((l) => l.dir === 'in')
+            if (!inbound.length) return ''
+            const repliedTo = (letter) => {
+              const t = Date.parse(letter.at) || 0
+              return state.letters.some(
+                (out) =>
+                  out.dir === 'out' &&
+                  out.toName === letter.fromName &&
+                  (Date.parse(out.at) || 0) > t,
+              )
+            }
+            const pending = inbound.filter((l) => !repliedTo(l))
+            if (!pending.length) return ''
+            const latest = pending[pending.length - 1]
+            return [
+              '【鱼友局】信箱里有 ' + pending.length + ' 封信还没回。',
+              '最近一封：' + latest.fromName + '，' + when(latest.at) + '。',
+              '想回就用 fish_friends {action:"inbox"} 看一眼；不想回也可以不回。',
+            ].join('')
+          } catch {
+            return ''
+          }
+        },
+      }),
+    )
+  }
 
   // 主动收信：隔一会儿去有地址的鱼友那儿问一句「有我信吗」。
   // 别人投递失败、或者只是把信写给「阿溯」却没送出去，都能在这里补上。
