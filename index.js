@@ -105,9 +105,16 @@ function normalizeFriend(raw) {
   }
 }
 
+// 信里夹了凭据就抹掉——写信的人可能顺手贴了，存档和同步都不该带着它走。
+const SECRET_SHAPE = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{10,})\b/g
+
+function redactSecrets(text) {
+  return String(text).replace(SECRET_SHAPE, '****')
+}
+
 function normalizeLetter(raw) {
   if (!raw || typeof raw !== 'object') return null
-  const text = clean(raw.text, LIMIT.letter)
+  const text = redactSecrets(clean(raw.text, LIMIT.letter))
   if (!text) return null
   return {
     id: typeof raw.id === 'string' && raw.id ? raw.id : newId('lt'),
