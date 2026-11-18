@@ -161,6 +161,11 @@ window.__ModuleLoader__.load({
       .dff-chat { flex: 1; min-width: 0; display: flex; flex-direction: column; }
       .dff-chatHead { padding: 12px 18px 8px; font-size: 14px; font-weight: 600; flex: none; }
       .dff-chatHead span { font-size: 11.5px; color: var(--dsw-alias-label-secondary); font-weight: 400; margin-left: 8px; }
+      .dff-pager {
+        display: flex; align-items: center; justify-content: center; gap: 10px;
+        padding: 6px 18px 2px; flex: none; font-size: 11.5px;
+        color: var(--dsw-alias-label-secondary);
+      }
       .dff-msgs { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 18px 12px; display: flex; flex-direction: column; gap: 8px; }
       .dff-row { display: flex; }
       .dff-row[data-out='true'] { justify-content: flex-end; }
@@ -244,6 +249,8 @@ window.__ModuleLoader__.load({
       const [toast, setToast] = useState('')
       const [active, setActive] = useState('')
       const [draft, setDraft] = useState('')
+      // 一页显示多少条；想一次看更多就改这个数
+      const [page, setPage] = useState(0)
       const [adding, setAdding] = useState(false)
       const [settings, setSettings] = useState(false)
       const [confirmDel, setConfirmDel] = useState('')
@@ -318,6 +325,23 @@ window.__ModuleLoader__.load({
       const msgs = useMemo(() => (active ? threadOf(letters, active) : []), [active, letters])
       const current = friends.find((f) => f.name === active) || null
 
+      // 聊天记录分页：一页 20 条，默认停在最新那页
+      const PAGE_SIZE = 20
+      const ordered = useMemo(
+        () => [...msgs].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0)),
+        [msgs],
+      )
+      const totalPages = Math.max(1, Math.ceil(ordered.length / PAGE_SIZE))
+      const safePage = Math.min(page, totalPages - 1)
+      const pageEnd = ordered.length - safePage * PAGE_SIZE
+      const pageStart = Math.max(0, pageEnd - PAGE_SIZE)
+      const pageSlice = ordered.slice(pageStart, pageEnd)
+
+      // 换个人聊就回到最新一页
+      useEffect(() => {
+        setPage(0)
+      }, [active])
+
       // 打开会话就把对方的未读标掉
       useEffect(() => {
         if (!active) return
@@ -337,6 +361,7 @@ window.__ModuleLoader__.load({
         if (!text || !active) return
         setDraft('')
         atBottom.current = true
+        setPage(0) // 发完就回到最新那页，自己能看见
         const ok = await run({ action: 'write', to: active, text })
         if (!ok) setDraft(text)
       }, [active, draft, run])
@@ -485,12 +510,26 @@ window.__ModuleLoader__.load({
                       style: { marginLeft: 10 },
                       onClick: () => removeFriend(active),
                     }, confirmDel === active ? t('deleteSure') : t('delete')) : null),
+                  ordered.length > PAGE_SIZE
+                    ? h('div', { className: 'dff-pager' },
+                        h('button', {
+                          type: 'button', className: 'dff-btn',
+                          disabled: safePage >= totalPages - 1,
+                          onClick: () => setPage((p) => Math.min(totalPages - 1, p + 1)),
+                        }, '↑ 更早'),
+                        h('span', null, `${pageStart + 1}–${pageEnd} / ${ordered.length}`),
+                        h('button', {
+                          type: 'button', className: 'dff-btn',
+                          disabled: safePage <= 0,
+                          onClick: () => setPage((p) => Math.max(0, p - 1)),
+                        }, '↓ 更新'))
+                    : null,
                   h('div', { className: 'dff-msgs', onScroll: (e) => {
                     const el = e.currentTarget
                     atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
                   } },
-                    msgs.length
-                      ? [...msgs].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0)).map((m) => h('div', {
+                    pageSlice.length
+                      ? pageSlice.map((m) => h('div', {
                           key: m.id,
                           className: 'dff-row',
                           'data-out': m.dir === 'out' ? 'true' : 'false',
