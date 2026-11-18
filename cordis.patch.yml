@@ -1,0 +1,7 @@
+# 鱼友局 —— 在家的鱼也能认识别的鱼。
+#
+# 一行：插件本体。数据写在 <DSH_HOME>/fish-friends/state.json，
+# 本机邮局走 /fish-friends/*（只对本机开放）。
+- insert:
+    - id: fish-friends
+      name: dsh-fish-friends
