@@ -338,12 +338,19 @@ async function applyOp(state, op, log) {
       writeState(state, log)
       if (friend.remote && friend.remote.base) {
         const sent = await deliver(state, friend, letter)
-        return say(
-          sent.ok
-            ? `递给 ${friend.name} 了（${when(letter.at)}）。`
-            : `先记在发件箱了：${friend.name} 那边没送到——${sent.reason}。`,
-          letter,
-        )
+        if (sent.ok) return say(`递给 ${friend.name} 了（${when(letter.at)}）。`, letter)
+        // 局域网没送到（她关了门、手机睡了），看看中转能不能兜住
+        if (relayReady(state)) {
+          const relayed = await deliverRelay(state, friend, letter)
+          if (relayed.ok) {
+            return say(`局域网没送到（${sent.reason}），从中转递给 ${friend.name} 了。`, letter)
+          }
+          return say(
+            `先记在发件箱了：${friend.name} 那边没送到——局域网：${sent.reason}；中转：${relayed.reason}。`,
+            letter,
+          )
+        }
+        return say(`先记在发件箱了：${friend.name} 那边没送到——${sent.reason}。`, letter)
       }
       // 没留地址，但有中转 topic 的话就走中转
       if (relayReady(state)) {
