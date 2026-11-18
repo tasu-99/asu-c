@@ -65,7 +65,7 @@ async function hit(routeKey, request) {
 
 if (!tool) fail('工具没注册上')
 else ok(`工具注册了：${tool.name}`)
-if (tool && tool.parameters.properties.action.enum.length !== 11) fail('action 枚举数量不对')
+if (tool && tool.parameters.properties.action.enum.length !== 12) fail('action 枚举数量不对')
 if (routes.size !== 6) fail(`路由数量不对：${[...routes.keys()].join(', ')}`)
 
 let out = await say({ action: 'overview' })
